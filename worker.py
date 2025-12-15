@@ -1,103 +1,82 @@
+import asyncio
 import logging
 import requests
 
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
-from config import (
-    TELEGRAM_BOT_TOKEN,
-    SMAIPL_API_URL,
-    SMAIPL_BOT_ID,
-    SUMMARY_COMMAND,
-)
+from config import TELEGRAM_BOT_TOKEN, SMAIPL_API_URL, SMAIPL_BOT_ID, SUMMARY_COMMAND
 
-# --------------------------------------------------
-# Логирование
-# --------------------------------------------------
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("summary-bot")
 
-# --------------------------------------------------
-# /start
-# --------------------------------------------------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Summary Bot запущен.\n"
-        "Отправляй сообщения или вставляй текст.\n"
-        "Для summary используй команду /summary"
-    )
+    await update.message.reply_text("Summary Bot готов. Пиши сообщения, затем команда /summary.")
 
-# --------------------------------------------------
-# Сбор всех сообщений (copy-paste тоже сюда попадает)
-# --------------------------------------------------
-async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Команда: /summary — сделать обзор последних сообщений.")
+
+
+async def collect_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
-
     history = context.chat_data.setdefault("history", [])
     history.append(update.message.text)
+    # ограничим память
+    if len(history) > 200:
+        context.chat_data["history"] = history[-200:]
 
-    # ограничим историю
-    if len(history) > 300:
-        context.chat_data["history"] = history[-300:]
 
-# --------------------------------------------------
-# /summary
-# --------------------------------------------------
+def _call_smaipl_sync(chat_id: int, text: str) -> str:
+    payload = {
+        "bot_id": SMAIPL_BOT_ID,
+        "chat_id": str(chat_id),
+        "message": f"Сделай краткое summary диалога (структурировано, пункты):\n{text}",
+    }
+    r = requests.post(SMAIPL_API_URL, json=payload, timeout=90)
+    r.raise_for_status()
+    data = r.json()
+    return data.get("answer") or data.get("text") or str(data)
+
+
 async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
     history = context.chat_data.get("history", [])
 
     if not history:
         await update.message.reply_text("Пока нечего суммировать.")
         return
 
-    text = "\n".join(history[-50:])
+    await update.message.reply_text("Ок, делаю summary...")
 
-    payload = {
-        "bot_id": SMAIPL_BOT_ID,
-        "chat_id": str(update.effective_chat.id),
-        "message": f"Сделай краткое summary диалога:\n{text}",
-    }
+    text = "\n".join(history[-50:])  # последние 50 сообщений
 
+    loop = asyncio.get_running_loop()
     try:
-        r = requests.post(SMAIPL_API_URL, json=payload, timeout=60)
-        r.raise_for_status()
-        result = r.json()
+        answer = await loop.run_in_executor(None, _call_smaipl_sync, chat_id, text)
     except Exception as e:
-        logger.exception("Ошибка при запросе к SMAIPL")
-        await update.message.reply_text(f"Ошибка при запросе к SMAIPL:\n{e}")
+        await update.message.reply_text(f"Ошибка при запросе к SMAIPL: {e}")
         return
-
-    answer = (
-        result.get("answer")
-        or result.get("text")
-        or result.get("response")
-        or str(result)
-    )
 
     await update.message.reply_text(answer)
 
-# --------------------------------------------------
-# main
-# --------------------------------------------------
+
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler(SUMMARY_COMMAND.lstrip("/"), summary))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, collect_message))
+    app.add_handler(CommandHandler("help", help_cmd))
 
-    logger.info("Summary Bot started")
+    # /summary (без слэша в CommandHandler)
+    app.add_handler(CommandHandler(SUMMARY_COMMAND.lstrip("/"), summary))
+
+    # сбор всех обычных сообщений
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, collect_messages))
+
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
