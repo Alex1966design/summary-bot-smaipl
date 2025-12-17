@@ -3,7 +3,7 @@ import re
 import json
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from collections import defaultdict
 
 import httpx
@@ -17,15 +17,15 @@ from telegram.ext import (
 )
 
 # ==========================================================
-# 0) LOGGING (must be at the very top of the entrypoint)
+# 0) LOGGING (entrypoint: must be first)
 # ==========================================================
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-class RedactTelegramTokenFilter(logging.Filter):
+class RedactSecretsFilter(logging.Filter):
     """
-    Extra safety: redact Telegram bot tokens if they appear in log messages.
-    Token pattern: digits ':' base64url-like string.
+    Redacts Telegram bot tokens and URLs if they appear in log messages.
+    This is a safety net. Primary protection is disabling httpx/httpcore noisy logs.
     """
     _token_re = re.compile(r"(\b\d{6,}:[A-Za-z0-9_-]{20,}\b)")
     _bot_url_re = re.compile(r"(https://api\.telegram\.org/bot)(\d{6,}:[A-Za-z0-9_-]{20,})")
@@ -45,52 +45,89 @@ logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-# Force root level in case something else sets DEBUG later
 logging.getLogger().setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
-# CRITICAL: prevent httpx/httpcore from logging full request URLs (which include bot token)
+# Critical: avoid printing request URLs (they include bot token)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+# Telegram libs can be chatty on DEBUG; keep INFO
 logging.getLogger("telegram").setLevel(logging.INFO)
 logging.getLogger("telegram.ext").setLevel(logging.INFO)
 
 log = logging.getLogger("summary_bot")
-log.addFilter(RedactTelegramTokenFilter())
+log.addFilter(RedactSecretsFilter())
 
 # ==========================================================
-# 1) ENV / CONFIG
+# 1) CONFIG (all via env; no further code edits needed)
 # ==========================================================
+
+APP_VERSION = os.getenv("APP_VERSION", "stable-1").strip()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-
-SMAIPL_API_URL = os.getenv("SMAIPL_API_URL", "").strip()
-SMAIPL_BOT_ID = os.getenv("SMAIPL_BOT_ID", "").strip()  # ключ/токен SMAIPL (если нужен)
-SMAIPL_TIMEOUT = float(os.getenv("SMAIPL_TIMEOUT", "30"))
-SMAIPL_VERIFY_SSL = os.getenv("SMAIPL_VERIFY_SSL", "true").lower() in ("1", "true", "yes")
-
-SUMMARY_COMMAND = os.getenv("SUMMARY_COMMAND", "/summary").strip()  # "/summary"
-HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "200"))             # сколько всего храним
-SUMMARY_LAST_N = int(os.getenv("SUMMARY_LAST_N", "50"))            # сколько брать для summary
-
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
+SUMMARY_COMMAND = os.getenv("SUMMARY_COMMAND", "/summary").strip()  # "/summary"
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "200"))             # store up to N messages per chat
+SUMMARY_LAST_N = int(os.getenv("SUMMARY_LAST_N", "50"))            # include last N into summary request
+
+# SMAIPL settings (optional; command still works without SMAIPL via fallback)
+SMAIPL_ENABLED = os.getenv("SMAIPL_ENABLED", "true").lower() in ("1", "true", "yes")
+SMAIPL_API_URL = os.getenv("SMAIPL_API_URL", "").strip()
+SMAIPL_METHOD = os.getenv("SMAIPL_METHOD", "POST").upper().strip()  # POST/GET
+SMAIPL_TIMEOUT = float(os.getenv("SMAIPL_TIMEOUT", "30"))
+SMAIPL_VERIFY_SSL = os.getenv("SMAIPL_VERIFY_SSL", "true").lower() in ("1", "true", "yes")
+
+# Auth: supports Bearer, X-API-Key, or none
+SMAIPL_AUTH_TYPE = os.getenv("SMAIPL_AUTH_TYPE", "bearer").lower().strip()  # bearer|x-api-key|none
+SMAIPL_AUTH_VALUE = os.getenv("SMAIPL_AUTH_VALUE", os.getenv("SMAIPL_BOT_ID", "")).strip()
+
+# Payload template is configurable to avoid “we must change code to match SMAIPL contract”
+# Default matches what you used earlier: bot_id/chat_id/message
+DEFAULT_PAYLOAD_TEMPLATE = {
+    "bot_id": "{auth_value}",
+    "chat_id": "{chat_id}",
+    "message": "{text}",
+}
+SMAIPL_PAYLOAD_TEMPLATE_JSON = os.getenv("SMAIPL_PAYLOAD_TEMPLATE_JSON", "").strip()
+
+# Response field preference
+SMAIPL_RESPONSE_FIELD = os.getenv("SMAIPL_RESPONSE_FIELD", "summary").strip()  # summary/result/text/answer/output
+
+
+def _load_payload_template() -> Dict[str, Any]:
+    if not SMAIPL_PAYLOAD_TEMPLATE_JSON:
+        return DEFAULT_PAYLOAD_TEMPLATE
+    try:
+        tpl = json.loads(SMAIPL_PAYLOAD_TEMPLATE_JSON)
+        if not isinstance(tpl, dict):
+            raise ValueError("template is not a JSON object")
+        return tpl
+    except Exception as e:
+        log.warning("Invalid SMAIPL_PAYLOAD_TEMPLATE_JSON, using default. Error: %s", e)
+        return DEFAULT_PAYLOAD_TEMPLATE
+
+
+SMAIPL_PAYLOAD_TEMPLATE = _load_payload_template()
+
 # ==========================================================
-# 2) STATE (in-memory history + per-chat lock)
+# 2) STATE (history + per-chat locks)
 # ==========================================================
 
 chat_history: Dict[int, List[Dict[str, str]]] = defaultdict(list)
 chat_locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+
 
 def add_history(chat_id: int, user: str, text: str) -> None:
     chat_history[chat_id].append({"user": user, "text": text})
     if len(chat_history[chat_id]) > HISTORY_LIMIT:
         chat_history[chat_id] = chat_history[chat_id][-HISTORY_LIMIT:]
 
+
 def build_context(chat_id: int) -> str:
     items = chat_history.get(chat_id, [])
     items = items[-SUMMARY_LAST_N:] if SUMMARY_LAST_N > 0 else items
-
     lines: List[str] = []
     for it in items:
         u = (it.get("user") or "user").strip()
@@ -99,56 +136,97 @@ def build_context(chat_id: int) -> str:
             lines.append(f"{u}: {t}")
     return "\n".join(lines).strip()
 
+
+def fallback_summary(text: str) -> str:
+    """
+    Guaranteed response even if SMAIPL is down/misconfigured.
+    This is intentionally simple and robust.
+    """
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return "Нет данных для summary."
+    # Take last 10 lines and format as bullets
+    last = lines[-10:]
+    out = ["Summary (fallback):", ""]
+    out += [f"• {ln[:300]}" for ln in last]
+    return "\n".join(out)
+
+
+def render_template(obj: Any, vars_map: Dict[str, str]) -> Any:
+    """
+    Recursively substitutes placeholders in strings:
+    {chat_id}, {text}, {auth_value}
+    """
+    if isinstance(obj, dict):
+        return {k: render_template(v, vars_map) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [render_template(v, vars_map) for v in obj]
+    if isinstance(obj, str):
+        try:
+            return obj.format(**vars_map)
+        except Exception:
+            return obj
+    return obj
+
 # ==========================================================
-# 3) SMAIPL client (async)
+# 3) SMAIPL client
 # ==========================================================
 
-async def smaipl_generate_summary(chat_id: int, context_text: str) -> str:
+async def call_smaipl(chat_id: int, context_text: str) -> str:
+    if not SMAIPL_ENABLED:
+        raise RuntimeError("SMAIPL is disabled")
     if not SMAIPL_API_URL:
         raise RuntimeError("SMAIPL_API_URL is not configured")
 
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-    # Если SMAIPL требует авторизацию — используем Bearer.
-    # Если у SMAIPL другой формат — поменяем здесь, в одном месте.
-    if SMAIPL_BOT_ID:
-        headers["Authorization"] = f"Bearer {SMAIPL_BOT_ID}"
+    headers = {"Accept": "application/json"}
 
-    # ВАЖНО: payload может отличаться в SMAIPL — это частая причина 400.
-    # Сейчас оставляю максимально совместимый вариант (как у тебя было: bot_id/chat_id/message).
-    payload = {
-        "bot_id": SMAIPL_BOT_ID or "unknown",
+    if SMAIPL_AUTH_TYPE == "bearer" and SMAIPL_AUTH_VALUE:
+        headers["Authorization"] = f"Bearer {SMAIPL_AUTH_VALUE}"
+    elif SMAIPL_AUTH_TYPE == "x-api-key" and SMAIPL_AUTH_VALUE:
+        headers["X-API-Key"] = SMAIPL_AUTH_VALUE
+    # else: none
+
+    vars_map = {
         "chat_id": str(chat_id),
-        "message": context_text,
+        "text": context_text,
+        "auth_value": SMAIPL_AUTH_VALUE or "",
     }
+    payload = render_template(SMAIPL_PAYLOAD_TEMPLATE, vars_map)
 
-    # Безопасный лог: не печатаем context целиком
-    log.info("SMAIPL request: chat_id=%s, chars=%s, last_n=%s", chat_id, len(context_text), SUMMARY_LAST_N)
+    # Safe log (no payload text)
+    log.info("SMAIPL call: method=%s chat_id=%s chars=%s verify_ssl=%s",
+             SMAIPL_METHOD, chat_id, len(context_text), SMAIPL_VERIFY_SSL)
 
     async with httpx.AsyncClient(timeout=SMAIPL_TIMEOUT, verify=SMAIPL_VERIFY_SSL) as client:
-        r = await client.post(SMAIPL_API_URL, headers=headers, json=payload)
+        if SMAIPL_METHOD == "GET":
+            r = await client.get(SMAIPL_API_URL, headers=headers, params=payload)
+        else:
+            headers.setdefault("Content-Type", "application/json")
+            r = await client.post(SMAIPL_API_URL, headers=headers, json=payload)
 
     if r.status_code == 400:
-        # Обязательно показываем текст ошибки SMAIPL — это ключ к исправлению схемы payload
+        # This is the single most useful diagnostic line
         raise RuntimeError(f"SMAIPL 400: {r.text}")
 
     r.raise_for_status()
 
-    # Пытаемся извлечь текст summary из JSON
+    # Parse response
     try:
         data = r.json()
     except Exception:
         return r.text.strip()
 
     if isinstance(data, dict):
-        for key in ("summary", "result", "text", "answer", "output"):
+        # Prefer explicit field from env
+        v = data.get(SMAIPL_RESPONSE_FIELD)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+        # Common fallbacks
+        for key in ("summary", "result", "text", "answer", "output", "message"):
             v = data.get(key)
             if isinstance(v, str) and v.strip():
                 return v.strip()
 
-    # fallback: отдадим JSON как строку
     return json.dumps(data, ensure_ascii=False)
 
 # ==========================================================
@@ -156,24 +234,30 @@ async def smaipl_generate_summary(chat_id: int, context_text: str) -> str:
 # ==========================================================
 
 async def on_startup(app):
-    # Критично для стабильности: отключаем webhook и чистим pending updates
     await app.bot.delete_webhook(drop_pending_updates=True)
     me = await app.bot.get_me()
+    log.info("App version: %s", APP_VERSION)
     log.info("Bot started: @%s (id=%s). Webhook cleared.", me.username, me.id)
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Напиши несколько сообщений, затем используй /summary для сводки.")
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Бот запущен.\n"
+        "Напиши несколько сообщений, затем вызови /summary.\n"
+        "Команды: /summary /clear /ping"
+    )
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Команды:\n"
-                                    "/summary — сделать сводку по последним сообщениям\n"
-                                    "/clear — очистить историю чата\n"
-                                    "/ping — проверка бота")
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Команды:\n"
+        "/summary — сводка по последним сообщениям\n"
+        "/clear — очистить историю\n"
+        "/ping — проверка"
+    )
 
-async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong")
 
-async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat:
         chat_history.pop(update.effective_chat.id, None)
     await update.message.reply_text("История очищена.")
@@ -184,19 +268,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if not text:
         return
-    # не пишем команды в историю
     if text.startswith("/"):
         return
     user = update.effective_user.full_name if update.effective_user else "user"
     add_history(update.effective_chat.id, user, text)
 
-async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_chat:
         return
 
     chat_id = update.effective_chat.id
-
-    # 1 summary at a time per chat
     async with chat_locks[chat_id]:
         await update.message.reply_text("Готовлю summary…")
 
@@ -205,18 +286,22 @@ async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Недостаточно истории. Напиши несколько сообщений и повтори /summary.")
             return
 
+        # Try SMAIPL; if it fails, return fallback summary (so command always works)
         try:
-            result = await smaipl_generate_summary(chat_id, ctx)
+            result = await call_smaipl(chat_id, ctx)
+            if not result.strip():
+                raise RuntimeError("SMAIPL returned empty response")
+            prefix = "Summary (SMAIPL):\n\n"
+            out = prefix + result.strip()
         except Exception as e:
-            log.exception("Summary failed chat_id=%s", chat_id)
-            await update.message.reply_text(f"Ошибка генерации summary: {e}")
-            return
+            log.exception("SMAIPL failed; using fallback. chat_id=%s", chat_id)
+            out = fallback_summary(ctx) + f"\n\n[SMAIPL error: {e}]"
 
-        # Telegram limit safety
-        if len(result) > 3900:
-            result = result[:3900] + "\n\n[сообщение обрезано]"
+        # Telegram length safety
+        if len(out) > 3900:
+            out = out[:3900] + "\n\n[сообщение обрезано]"
 
-        await update.message.reply_text(result)
+        await update.message.reply_text(out)
 
 # ==========================================================
 # 5) Main
@@ -232,14 +317,14 @@ def main():
         .build()
     )
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("ping", ping_cmd))
-    app.add_handler(CommandHandler("clear", clear_cmd))
-    app.add_handler(CommandHandler(cmd, summary_cmd))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("ping", cmd_ping))
+    app.add_handler(CommandHandler("clear", cmd_clear))
+    app.add_handler(CommandHandler(cmd, cmd_summary))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    # Polling: one instance only (Railway: scale=1)
+    # Polling: Railway must be scale=1
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
