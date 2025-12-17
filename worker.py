@@ -1,330 +1,251 @@
 import os
 import json
-import time
-import sqlite3
+import asyncio
 import logging
-from typing import Optional, List, Tuple
+from typing import Any, Dict, Optional
 
 import httpx
-from fastapi import FastAPI, Request, Header, HTTPException
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+import uvicorn
+
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
-    MessageHandler,
     ContextTypes,
-    filters,
 )
 
-# -----------------------------
+# -------------------------
 # Logging
-# -----------------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+# -------------------------
 logging.basicConfig(
-    level=LOG_LEVEL,
+    level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("summary_bot")
+log = logging.getLogger("summary_bot")
 
-# -----------------------------
-# Env / Config
-# -----------------------------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")  # e.g. https://charismatic-smile-production.up.railway.app
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()  # random string
-PORT = int(os.getenv("PORT", "8080"))
+# -------------------------
+# ENV
+# -------------------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+# Пример: https://charismatic-smile-production.up.railway.app
+
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+# Это часть URL пути: /webhook/<WEBHOOK_SECRET>
+
+# Telegram "secret_token" (опционально). Если задан — будем проверять заголовок.
+WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip()
 
 SMAIPL_API_URL = os.getenv("SMAIPL_API_URL", "").strip()
-SMAIPL_BOT_ID = os.getenv("SMAIPL_BOT_ID", "").strip()  # optional; if empty, we won't send it
-SMAIPL_CHAT_ID = os.getenv("SMAIPL_CHAT_ID", "").strip()  # optional; if empty, we won't send it
+# Пример: https://api.smaipl.ru/api/v1.0/ask/<...>
+
+SMAIPL_BOT_ID = os.getenv("SMAIPL_BOT_ID", "").strip()  # например 5129
+SMAIPL_CHAT_ID = os.getenv("SMAIPL_CHAT_ID", "").strip()  # например ask123456
+SMAIPL_RESPONSE_FIELD = os.getenv("SMAIPL_RESPONSE_FIELD", "done").strip()
 SMAIPL_TIMEOUT = float(os.getenv("SMAIPL_TIMEOUT", "60"))
 
-# DB for storing recent messages per chat (so /summary can work without reply)
-DB_PATH = os.getenv("SQLITE_PATH", "/tmp/summary_bot.sqlite3")
-MAX_STORED_PER_CHAT = int(os.getenv("MAX_STORED_PER_CHAT", "50"))
+PORT = int(os.getenv("PORT", "8080"))
 
+# -------------------------
+# Validation
+# -------------------------
+if not TELEGRAM_TOKEN:
+    log.warning("TELEGRAM_TOKEN is empty. Bot will not start correctly.")
 
-def require_env():
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
-    if not PUBLIC_BASE_URL:
-        raise RuntimeError("PUBLIC_BASE_URL is missing (e.g. https://<app>.up.railway.app)")
-    if not WEBHOOK_SECRET:
-        raise RuntimeError("WEBHOOK_SECRET is missing (random string)")
-    if not SMAIPL_API_URL:
-        raise RuntimeError("SMAIPL_API_URL is missing (your SMAIPL endpoint)")
+if not PUBLIC_BASE_URL:
+    log.warning("PUBLIC_BASE_URL is empty. Webhook setup will fail.")
 
+if not WEBHOOK_SECRET:
+    log.warning("WEBHOOK_SECRET is empty. Webhook path will be insecure/invalid.")
 
-# -----------------------------
-# SQLite helpers
-# -----------------------------
-def db_init():
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS messages (
-                chat_id INTEGER NOT NULL,
-                message_id INTEGER NOT NULL,
-                user_id INTEGER,
-                username TEXT,
-                text TEXT,
-                ts INTEGER NOT NULL
-            )
-            """
-        )
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_id, ts)")
-        conn.commit()
-    finally:
-        conn.close()
+if not SMAIPL_API_URL:
+    log.warning("SMAIPL_API_URL is empty. /summary will return error.")
 
-
-def db_add_message(chat_id: int, message_id: int, user_id: Optional[int], username: str, text: str):
-    if not text:
-        return
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO messages(chat_id, message_id, user_id, username, text, ts) VALUES (?, ?, ?, ?, ?, ?)",
-            (chat_id, message_id, user_id, username or "", text, int(time.time())),
-        )
-        # keep last MAX_STORED_PER_CHAT
-        cur.execute(
-            """
-            DELETE FROM messages
-            WHERE rowid IN (
-                SELECT rowid
-                FROM messages
-                WHERE chat_id = ?
-                ORDER BY ts DESC
-                LIMIT -1 OFFSET ?
-            )
-            """,
-            (chat_id, MAX_STORED_PER_CHAT),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def db_get_last_user_text(chat_id: int) -> Optional[str]:
-    """Return last non-command text message for this chat."""
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT text
-            FROM messages
-            WHERE chat_id = ?
-              AND text IS NOT NULL
-              AND TRIM(text) != ''
-              AND text NOT LIKE '/%'
-            ORDER BY ts DESC
-            LIMIT 1
-            """,
-            (chat_id,),
-        )
-        row = cur.fetchone()
-        return row[0] if row else None
-    finally:
-        conn.close()
-
-
-# -----------------------------
-# SMAIPL call
-# -----------------------------
-def _extract_smaipl_text(data) -> Optional[str]:
-    """
-    SMAIPL may return different shapes; we try a few common fields.
-    In your screenshot example, they used .json()['done'].
-    """
-    if data is None:
-        return None
-    if isinstance(data, str):
-        return data
-    if isinstance(data, dict):
-        if data.get("error") is True:
-            return None
-        for key in ("done", "result", "answer", "text", "message", "output"):
-            val = data.get(key)
-            if isinstance(val, str) and val.strip():
-                return val.strip()
-        # sometimes nested
-        for key in ("data", "response"):
-            nested = data.get(key)
-            if isinstance(nested, dict):
-                t = _extract_smaipl_text(nested)
-                if t:
-                    return t
-    return None
-
-
-def call_smaipl(prompt: str) -> str:
-    payload = {"message": prompt}
-    # If your SMAIPL endpoint requires these fields — set them in Railway Variables
-    if SMAIPL_BOT_ID:
-        payload["bot_id"] = int(SMAIPL_BOT_ID) if SMAIPL_BOT_ID.isdigit() else SMAIPL_BOT_ID
-    if SMAIPL_CHAT_ID:
-        payload["chat_id"] = SMAIPL_CHAT_ID
-
-    with httpx.Client(timeout=SMAIPL_TIMEOUT) as client:
-        r = client.post(SMAIPL_API_URL, json=payload)
-        # even on 200 SMAIPL might return {"error": true}
-        try:
-            data = r.json()
-        except Exception:
-            raise RuntimeError(f"SMAIPL returned non-JSON: status={r.status_code}, body={r.text[:300]}")
-
-    text = _extract_smaipl_text(data)
-    if not text:
-        raise RuntimeError(f"SMAIPL error/empty response: status={r.status_code}, body={json.dumps(data, ensure_ascii=False)[:500]}")
-    return text
-
-
-# -----------------------------
-# Telegram handlers
-# -----------------------------
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Привет. Я Summary Bot.\n\n"
-        "Как использовать:\n"
-        "1) Ответь (Reply) на нужное сообщение командой /summary — сделаю краткое резюме.\n"
-        "2) Или отправь /summary без Reply — я суммаризирую последнее сообщение в чате.\n"
-    )
-
-
-async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    chat_id = msg.chat_id
-
-    # 1) Prefer replied message text
-    target_text = None
-    if msg.reply_to_message and msg.reply_to_message.text:
-        target_text = msg.reply_to_message.text.strip()
-
-    # 2) Else: last user text from DB
-    if not target_text:
-        target_text = db_get_last_user_text(chat_id)
-
-    if not target_text:
-        await msg.reply_text("Не вижу текста для суммаризации. Ответь (Reply) на сообщение и отправь /summary.")
-        return
-
-    await msg.reply_text("Готовлю summary...")
-
-    # Build prompt for SMAIPL
-    prompt = (
-        "Сделай краткое резюме текста на русском.\n"
-        "Формат:\n"
-        "1) Суть (1-2 предложения)\n"
-        "2) Ключевые пункты (5-7 буллетов)\n"
-        "3) Следующие шаги (если применимо, 3-5 буллетов)\n\n"
-        f"Текст:\n{target_text}"
-    )
-
-    try:
-        # run sync HTTP in threadpool
-        resp = await context.application.run_in_threadpool(call_smaipl, prompt)
-        await msg.reply_text(resp, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    except Exception as e:
-        logger.exception("Summary failed")
-        await msg.reply_text(f"Ошибка при генерации summary: {e}")
-
-
-async def store_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not msg or not msg.text:
-        return
-    # store any plain text (including long messages); commands are stored too, but excluded by query
-    db_add_message(
-        chat_id=msg.chat_id,
-        message_id=msg.message_id,
-        user_id=msg.from_user.id if msg.from_user else None,
-        username=msg.from_user.username if msg.from_user else "",
-        text=msg.text,
-    )
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.exception("Unhandled error: %s", context.error)
-
-
-# -----------------------------
-# FastAPI + Webhook bridge
-# -----------------------------
+# -------------------------
+# FastAPI
+# -------------------------
 app = FastAPI()
 tg_app: Optional[Application] = None
 
 
-@app.get("/health")
-async def health():
-    return {"ok": True}
+# -------------------------
+# SMAIPL call (sync function for to_thread)
+# -------------------------
+def call_smaipl_sync(prompt: str) -> Dict[str, Any]:
+    """
+    Синхронный вызов SMAIPL, чтобы запускать через asyncio.to_thread.
+    Ожидаем, что SMAIPL возвращает JSON и итог лежит в поле SMAIPL_RESPONSE_FIELD (по умолчанию 'done').
+    """
+    if not SMAIPL_API_URL:
+        return {"error": True, "detail": "SMAIPL_API_URL is not set"}
+
+    payload: Dict[str, Any] = {"message": prompt}
+
+    # Если у вас SMAIPL требует bot_id/chat_id — добавляем
+    if SMAIPL_BOT_ID:
+        try:
+            payload["bot_id"] = int(SMAIPL_BOT_ID)
+        except ValueError:
+            payload["bot_id"] = SMAIPL_BOT_ID
+
+    if SMAIPL_CHAT_ID:
+        payload["chat_id"] = SMAIPL_CHAT_ID
+
+    try:
+        with httpx.Client(timeout=SMAIPL_TIMEOUT) as client:
+            r = client.post(SMAIPL_API_URL, json=payload)
+            r.raise_for_status()
+            data = r.json()
+            return data
+    except Exception as e:
+        return {"error": True, "detail": str(e)}
 
 
-@app.post("/webhook/{secret}")
-async def telegram_webhook(
-    secret: str,
-    request: Request,
-    x_telegram_bot_api_secret_token: Optional[str] = Header(default=None),
-):
-    # 1) Path secret
-    if secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    # 2) Optional header secret (Telegram sends it if setWebhook secret_token used)
-    if x_telegram_bot_api_secret_token and x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403, detail="Bad secret token")
-
-    data = await request.json()
-    update = Update.de_json(data, tg_app.bot)
-    await tg_app.process_update(update)
-    return {"ok": True}
+# -------------------------
+# Telegram handlers
+# -------------------------
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Привет! Я Summary Bot.\n\n"
+        "Как пользоваться:\n"
+        "1) Ответь (Reply) на сообщение, которое нужно суммаризировать\n"
+        "2) В ответе напиши команду: /summary\n\n"
+        "Я отправлю текст в SMAIPL и верну результат."
+    )
 
 
-@app.on_event("startup")
-async def on_startup():
+async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if msg is None:
+        return
+
+    # Требуем reply
+    if not msg.reply_to_message or not msg.reply_to_message.text:
+        await msg.reply_text("Команду /summary нужно отправлять *ответом* на сообщение для суммаризации.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    prompt = msg.reply_to_message.text.strip()
+    if not prompt:
+        await msg.reply_text("Пустой текст. Пришлите сообщение с текстом и ответьте на него /summary.")
+        return
+
+    await msg.reply_text("Готовлю summary...")
+
+    # ВАЖНО: правильная замена run_in_threadpool -> asyncio.to_thread
+    data = await asyncio.to_thread(call_smaipl_sync, prompt)
+
+    if isinstance(data, dict) and data.get("error"):
+        await msg.reply_text(f"Ошибка при генерации summary: {json.dumps(data, ensure_ascii=False)}")
+        return
+
+    # Достаём результат
+    result = None
+    if isinstance(data, dict):
+        result = data.get(SMAIPL_RESPONSE_FIELD)
+        # если поле другое — покажем весь JSON, чтобы быстро понять структуру
+        if result is None:
+            await msg.reply_text(
+                "SMAIPL вернул JSON без ожидаемого поля.\n"
+                f"Ожидали поле: {SMAIPL_RESPONSE_FIELD}\n\n"
+                f"Ответ SMAIPL: {json.dumps(data, ensure_ascii=False)}"
+            )
+            return
+
+    await msg.reply_text(str(result))
+
+
+# -------------------------
+# Startup / shutdown
+# -------------------------
+async def setup_telegram() -> None:
     global tg_app
-    require_env()
-    db_init()
+    tg_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    tg_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     tg_app.add_handler(CommandHandler("start", start_cmd))
     tg_app.add_handler(CommandHandler("summary", summary_cmd))
-    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, store_text))
-    tg_app.add_error_handler(error_handler)
 
     await tg_app.initialize()
     await tg_app.start()
 
-    webhook_url = f"{PUBLIC_BASE_URL}/webhook/{WEBHOOK_SECRET}"
-
-    # setWebhook with secret_token => Telegram will send header X-Telegram-Bot-Api-Secret-Token
-    await tg_app.bot.set_webhook(
-        url=webhook_url,
-        secret_token=WEBHOOK_SECRET,
-        drop_pending_updates=True,
-    )
     me = await tg_app.bot.get_me()
-    logger.info("Bot started: @%s (id=%s)", me.username, me.id)
-    logger.info("Webhook set to: %s", webhook_url)
+    log.info(f"Bot started: @{me.username} (id={me.id})")
+
+    # setWebhook
+    if PUBLIC_BASE_URL and WEBHOOK_SECRET:
+        webhook_url = f"{PUBLIC_BASE_URL}/webhook/{WEBHOOK_SECRET}"
+        kwargs: Dict[str, Any] = {"url": webhook_url, "drop_pending_updates": True}
+
+        # Telegram secret_token (опционально)
+        if WEBHOOK_SECRET_TOKEN:
+            kwargs["secret_token"] = WEBHOOK_SECRET_TOKEN
+
+        ok = await tg_app.bot.set_webhook(**kwargs)
+        log.info(f"Webhook set to: {webhook_url} | ok={ok}")
+    else:
+        log.warning("PUBLIC_BASE_URL or WEBHOOK_SECRET not set; webhook NOT configured.")
+
+
+async def shutdown_telegram() -> None:
+    global tg_app
+    if tg_app:
+        await tg_app.stop()
+        await tg_app.shutdown()
+        tg_app = None
+
+
+@app.on_event("startup")
+async def on_startup() -> None:
+    await setup_telegram()
 
 
 @app.on_event("shutdown")
-async def on_shutdown():
-    global tg_app
-    if tg_app:
-        try:
-            await tg_app.stop()
-            await tg_app.shutdown()
-        except Exception:
-            logger.exception("Shutdown error")
+async def on_shutdown() -> None:
+    await shutdown_telegram()
+
+
+# -------------------------
+# Routes
+# -------------------------
+@app.get("/health")
+async def health() -> Dict[str, Any]:
+    return {"status": "ok"}
+
+
+@app.post("/webhook/{secret}")
+async def telegram_webhook(secret: str, request: Request) -> JSONResponse:
+    # 1) проверка секрета в пути
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    # 2) (опционально) проверка Telegram secret_token
+    # Telegram шлёт заголовок: X-Telegram-Bot-Api-Secret-Token
+    if WEBHOOK_SECRET_TOKEN:
+        header_token = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if header_token != WEBHOOK_SECRET_TOKEN:
+            raise HTTPException(status_code=401, detail="Invalid secret token")
+
+    # 3) обработка апдейта
+    data = await request.json()
+    if not tg_app:
+        raise HTTPException(status_code=503, detail="Bot is not ready")
+
+    update = Update.de_json(data, tg_app.bot)
+    await tg_app.process_update(update)
+
+    return JSONResponse({"ok": True})
+
+
+# -------------------------
+# Entrypoint
+# -------------------------
+def main() -> None:
+    # uvicorn внутри процесса — Railway будет пинговать /health и webhook endpoint
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
 
 
 if __name__ == "__main__":
-    # Important: use PORT env directly (Railway sets it), do NOT pass "$PORT" as a literal string
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    main()
