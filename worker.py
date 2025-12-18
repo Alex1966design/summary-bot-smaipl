@@ -37,16 +37,11 @@ SMAIPL_CHAT_ID = os.getenv("SMAIPL_CHAT_ID", "").strip()  # например ask
 SMAIPL_RESPONSE_FIELD = os.getenv("SMAIPL_RESPONSE_FIELD", "done").strip()  # "done" по умолчанию
 
 if not BOT_TOKEN:
-    log.warning("BOT_TOKEN is empty. Bot will not work without it.")
+    log.warning("BOT_TOKEN is empty. Telegram bot will not start until it is set.")
 if not PUBLIC_BASE_URL:
     log.warning("PUBLIC_BASE_URL is empty. Webhook cannot be set without it.")
 if not WEBHOOK_SECRET:
     log.warning("WEBHOOK_SECRET is empty. Webhook path protection is disabled (NOT recommended).")
-
-# ----------------------------
-# Telegram Application (PTB)
-# ----------------------------
-tg_app = Application.builder().token(BOT_TOKEN).build()
 
 # ----------------------------
 # SMAIPL Call
@@ -61,8 +56,13 @@ def call_smaipl(prompt: str) -> str:
     if not SMAIPL_BOT_ID or not SMAIPL_CHAT_ID:
         raise RuntimeError("SMAIPL_BOT_ID / SMAIPL_CHAT_ID is not set")
 
+    try:
+        bot_id_int = int(SMAIPL_BOT_ID)
+    except ValueError as e:
+        raise RuntimeError("SMAIPL_BOT_ID must be an integer") from e
+
     payload = {
-        "bot_id": int(SMAIPL_BOT_ID),
+        "bot_id": bot_id_int,
         "chat_id": SMAIPL_CHAT_ID,
         "message": prompt,
     }
@@ -72,19 +72,16 @@ def call_smaipl(prompt: str) -> str:
         r.raise_for_status()
         data = r.json()
 
-    # типичная ошибка у тебя: {"error": true}
+    # типичная ошибка: {"error": true}
     if isinstance(data, dict) and data.get("error") is True:
-        # отдадим максимум полезного
         raise RuntimeError(f"SMAIPL returned error=true. Payload={payload}. Response={data}")
 
     # берём поле ответа
     if isinstance(data, dict) and SMAIPL_RESPONSE_FIELD in data:
-        val = data.get(SMAIPL_RESPONSE_FIELD)
-        return str(val)
+        return str(data.get(SMAIPL_RESPONSE_FIELD))
 
     # запасной вариант: если поле не найдено
     return json.dumps(data, ensure_ascii=False)
-
 
 # ----------------------------
 # Handlers
@@ -96,13 +93,15 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode="Markdown",
     )
 
-
 async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
 
     # Требуем, чтобы /summary было reply на сообщение
     if not msg.reply_to_message or not msg.reply_to_message.text:
-        await msg.reply_text("Команду /summary нужно отправлять *ответом* на сообщение для суммаризации.")
+        await msg.reply_text(
+            "Команду /summary нужно отправлять *ответом* на сообщение для суммаризации.",
+            parse_mode="Markdown",
+        )
         return
 
     source_text = msg.reply_to_message.text.strip()
@@ -119,70 +118,85 @@ async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
     try:
-        # ВАЖНО: run_in_threadpool из starlette, а не из telegram Application
         result = await run_in_threadpool(call_smaipl, prompt)
         await msg.reply_text(result)
     except Exception as e:
         log.exception("Summary generation failed")
         await msg.reply_text(f"Ошибка при генерации summary: {e}")
 
-
-tg_app.add_handler(CommandHandler("start", start_cmd))
-tg_app.add_handler(CommandHandler("summary", summary_cmd))
-
 # ----------------------------
 # FastAPI Webhook Server
+# IMPORTANT: Fly.io expects an ASGI app called `app` in `worker.py`
 # ----------------------------
-api = FastAPI()
+app = FastAPI()
 
+# Telegram Application (PTB) — создаём в startup, чтобы не падать при импорте
+tg_app: Optional[Application] = None
 
-@api.get("/health")
+def _build_tg_app() -> Application:
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start_cmd))
+    application.add_handler(CommandHandler("summary", summary_cmd))
+    return application
+
+@app.get("/health")
 async def health() -> Dict[str, Any]:
     return {"status": "ok"}
 
-
-@api.post("/webhook/{secret}")
+@app.post("/webhook/{secret}")
 async def telegram_webhook(
     secret: str,
     request: Request,
     x_telegram_bot_api_secret_token: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
+    global tg_app
+
+    if tg_app is None:
+        # Telegram не инициализирован (скорее всего нет BOT_TOKEN или старт ещё не прошёл)
+        raise HTTPException(status_code=503, detail="Telegram app is not initialised")
+
     # 1) Проверка секрета в URL
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
     # 2) Доп. проверка секрета в заголовке (Telegram умеет так)
-    # Если хочешь строго — раскомментируй блок ниже:
-    # if WEBHOOK_SECRET and x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
-    #     raise HTTPException(status_code=403, detail="Invalid secret token header")
+    if WEBHOOK_SECRET and x_telegram_bot_api_secret_token is not None:
+        # Если Telegram присылает заголовок — проверяем его.
+        # (Если заголовка нет, не блокируем, чтобы не зависеть от настроек Telegram)
+        if x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
+            raise HTTPException(status_code=403, detail="Invalid secret token header")
 
     data = await request.json()
     update = Update.de_json(data, tg_app.bot)
 
-    # ВАЖНО: webhook-режим — просто "скармливаем" update в PTB
     await tg_app.process_update(update)
     return {"ok": True}
 
-
 # ----------------------------
-# Startup: set webhook
+# Startup: init PTB and set webhook
 # ----------------------------
-@api.on_event("startup")
+@app.on_event("startup")
 async def on_startup() -> None:
-    # запускаем PTB "внутри" (без polling)
+    global tg_app
+
+    if not BOT_TOKEN:
+        log.error("BOT_TOKEN is empty: Telegram app will not start. Set BOT_TOKEN and redeploy/restart.")
+        return
+
+    # Инициализируем PTB
+    tg_app = _build_tg_app()
     await tg_app.initialize()
     await tg_app.start()
 
-    if not (PUBLIC_BASE_URL and BOT_TOKEN):
-        log.warning("Skipping setWebhook: PUBLIC_BASE_URL or BOT_TOKEN missing")
+    # Выставляем webhook (если есть базовый URL)
+    if not PUBLIC_BASE_URL:
+        log.warning("Skipping setWebhook: PUBLIC_BASE_URL missing")
         return
 
     webhook_path = f"/webhook/{WEBHOOK_SECRET}" if WEBHOOK_SECRET else "/webhook/no-secret"
     webhook_url = f"{PUBLIC_BASE_URL}{webhook_path}"
 
-    # setWebhook через Bot API
     try:
-        # secret_token можно передать Telegram, он будет присылать его в заголовке
         await tg_app.bot.set_webhook(
             url=webhook_url,
             secret_token=(WEBHOOK_SECRET if WEBHOOK_SECRET else None),
@@ -192,21 +206,23 @@ async def on_startup() -> None:
     except Exception:
         log.exception("Failed to set webhook")
 
-
-@api.on_event("shutdown")
+@app.on_event("shutdown")
 async def on_shutdown() -> None:
+    global tg_app
+    if tg_app is None:
+        return
     try:
         await tg_app.stop()
         await tg_app.shutdown()
     except Exception:
         log.exception("Shutdown error")
 
-
 # ----------------------------
-# Entrypoint (Railway)
+# Entrypoint (local)
+# Note: On Fly.io this block is typically NOT used (uvicorn worker:app is used)
 # ----------------------------
 if __name__ == "__main__":
     import uvicorn
 
     port = int(os.getenv("PORT", "8080"))
-    uvicorn.run(api, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port)
