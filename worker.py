@@ -1,11 +1,11 @@
+# worker.py
 import os
 import json
 import logging
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional
 
 import httpx
 from fastapi import FastAPI, Request, Header, HTTPException
-from starlette.concurrency import run_in_threadpool
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -27,45 +27,70 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 
 # SMAIPL (OpenAI-compatible)
-SMAIPL_BASE_URL = os.getenv("SMAIPL_BASE_URL", "https://ai.smaipl.ru/v1").strip().rstrip("/")
-SMAIPL_API_KEY = os.getenv("SMAIPL_API_KEY", "").strip()  # Bearer token (43891_...)
-SMAIPL_MODEL = os.getenv("SMAIPL_MODEL", "test_chat_1").strip()
+SMAIPL_BASE_URL = os.getenv("SMAIPL_BASE_URL", "").strip().rstrip("/")  # e.g. https://ai.smaipl.ru/v1
+SMAIPL_API_KEY = os.getenv("SMAIPL_API_KEY", "").strip()               # bearer token
+SMAIPL_MODEL = os.getenv("SMAIPL_MODEL", "").strip()                   # e.g. gpt-4.1o / gpt-4o-mini
 
-# Optional: push summary INTO SMAIPL chat (needs correct SMAIPL endpoint from them)
-SMAIPL_PUSH_URL = os.getenv("SMAIPL_PUSH_URL", "").strip()
-SMAIPL_PUSH_AUTH = os.getenv("SMAIPL_PUSH_AUTH", "").strip()  # optional auth for push
+# Optional: push summary to SMAIPL/anywhere (if you later need it)
+SMAIPL_PUSH_URL = os.getenv("SMAIPL_PUSH_URL", "").strip()             # optional endpoint to receive produced summary
+SMAIPL_PUSH_BEARER = os.getenv("SMAIPL_PUSH_BEARER", "").strip()        # optional bearer for push
 
 if not BOT_TOKEN:
     log.warning("BOT_TOKEN is empty. Telegram bot will not start until it is set.")
 if not PUBLIC_BASE_URL:
     log.warning("PUBLIC_BASE_URL is empty. Webhook cannot be set without it.")
 if not WEBHOOK_SECRET:
-    log.warning("WEBHOOK_SECRET is empty. Webhook path protection is disabled (NOT recommended).")
+    log.warning("WEBHOOK_SECRET is empty. URL protection is disabled (NOT recommended).")
+
+if not SMAIPL_BASE_URL:
+    log.warning("SMAIPL_BASE_URL is empty. SMAIPL calls will fail until it is set.")
 if not SMAIPL_API_KEY:
-    log.warning("SMAIPL_API_KEY is empty. SMAIPL generation will not work until it is set.")
+    log.warning("SMAIPL_API_KEY is empty. SMAIPL calls will fail until it is set.")
+if not SMAIPL_MODEL:
+    log.warning("SMAIPL_MODEL is empty. SMAIPL calls will fail until it is set.")
 
 # ----------------------------
-# SMAIPL: OpenAI-compatible call
+# Helpers
 # ----------------------------
-def call_smaipl_chat_completion(prompt: str) -> str:
+def _mask(s: str, keep: int = 6) -> str:
+    if not s:
+        return ""
+    if len(s) <= keep:
+        return "*" * len(s)
+    return f"{s[:3]}***{s[-(keep-3):]}"
+
+async def smaipl_chat_complete(user_text: str) -> str:
     """
-    Synchronous call to SMAIPL OpenAI-compatible endpoint:
-      POST {SMAIPL_BASE_URL}/chat/completions
-      Authorization: Bearer {SMAIPL_API_KEY}
+    Calls SMAIPL OpenAI-compatible endpoint: {SMAIPL_BASE_URL}/chat/completions
+    Returns assistant message content as string.
     """
+    if not SMAIPL_BASE_URL:
+        raise RuntimeError("SMAIPL_BASE_URL is not set (expected e.g. https://ai.smaipl.ru/v1)")
     if not SMAIPL_API_KEY:
         raise RuntimeError("SMAIPL_API_KEY is not set")
     if not SMAIPL_MODEL:
-        raise RuntimeError("SMAIPL_MODEL is not set")
+        raise RuntimeError("SMAIPL_MODEL is not set (e.g. gpt-4.1o)")
 
     url = f"{SMAIPL_BASE_URL}/chat/completions"
+
+    system_prompt = (
+        "Ты — ассистент-аналитик по проектным коммуникациям. "
+        "Сделай краткое, чёткое и структурированное резюме текста.\n\n"
+        "Формат ответа:\n"
+        "1) Кратко (1–2 предложения)\n"
+        "2) Ключевые пункты (буллеты)\n"
+        "3) Решения/действия (если есть)\n"
+        "4) Риски/вопросы (если есть)\n\n"
+        "Отвечай на русском. Не возвращай JSON, если я не прошу JSON."
+    )
+
     payload = {
         "model": SMAIPL_MODEL,
         "messages": [
-            {"role": "system", "content": "Ты помощник, который делает краткие, структурированные summary."},
-            {"role": "user", "content": prompt},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text},
         ],
-        # при желании можно добавить temperature/max_tokens, но оставим дефолты SMAIPL
+        "temperature": 0.2,
     }
 
     headers = {
@@ -73,101 +98,89 @@ def call_smaipl_chat_completion(prompt: str) -> str:
         "Content-Type": "application/json",
     }
 
-    with httpx.Client(timeout=90.0) as client:
-        r = client.post(url, headers=headers, json=payload)
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        r = await client.post(url, headers=headers, json=payload)
         r.raise_for_status()
         data = r.json()
 
-    # Ожидаем OpenAI-like структуру
     try:
-        return data["choices"][0]["message"]["content"]
+        content = data["choices"][0]["message"]["content"]
     except Exception:
-        return json.dumps(data, ensure_ascii=False)
+        raise RuntimeError(f"Unexpected SMAIPL response format: {json.dumps(data, ensure_ascii=False)}")
 
-# ----------------------------
-# OPTIONAL: push summary into SMAIPL chat/widget
-# ----------------------------
-def push_summary_to_smaipl(summary_text: str, meta: Optional[Dict[str, Any]] = None) -> None:
+    return (content or "").strip()
+
+async def push_summary_somewhere(summary_text: str, meta: Dict[str, Any]) -> None:
     """
-    This requires SMAIPL_PUSH_URL from SMAIPL side.
-    We cannot guess it reliably: ask SMAIPL support for endpoint to append a message into widget dialog.
-
-    Expected behavior: POST to SMAIPL_PUSH_URL with JSON payload containing summary and optional meta.
+    Optional: push produced summary to SMAIPL/another endpoint if you set SMAIPL_PUSH_URL.
+    This is how you can make “SMAIPL receive summary via API”.
     """
     if not SMAIPL_PUSH_URL:
-        # Not configured -> do nothing
         return
 
-    payload: Dict[str, Any] = {
-        "message": summary_text,
-        "meta": meta or {},
+    headers = {}
+    if SMAIPL_PUSH_BEARER:
+        headers["Authorization"] = f"Bearer {SMAIPL_PUSH_BEARER}"
+
+    payload = {
+        "summary": summary_text,
+        "meta": meta,
     }
 
-    headers: Dict[str, str] = {"Content-Type": "application/json"}
-    if SMAIPL_PUSH_AUTH:
-        headers["Authorization"] = f"Bearer {SMAIPL_PUSH_AUTH}"
-
-    with httpx.Client(timeout=30.0) as client:
-        r = client.post(SMAIPL_PUSH_URL, headers=headers, json=payload)
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.post(SMAIPL_PUSH_URL, headers=headers, json=payload)
         r.raise_for_status()
 
 # ----------------------------
-# Telegram Handlers
+# Telegram handlers
 # ----------------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "Привет! Я Summary Bot.\n\n"
-        "Команда: /summary — отправляй ответом (reply) на сообщение, которое нужно суммаризировать."
+        "Команда: /summary — отправляй *ответом (reply)* на сообщение, которое нужно суммаризировать.",
+        parse_mode="Markdown",
     )
 
 async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
 
-    # /summary must be a reply
-    if not msg.reply_to_message:
-        await msg.reply_text("Команду /summary нужно отправлять ответом (reply) на сообщение для суммаризации.")
+    # /summary must be a reply to a message with text
+    if not msg.reply_to_message or not (msg.reply_to_message.text or msg.reply_to_message.caption):
+        await msg.reply_text(
+            "Команду /summary нужно отправлять *ответом* на сообщение для суммаризации.",
+            parse_mode="Markdown",
+        )
         return
 
-    # Text can be in text OR caption (if replied message is media)
-    source_text = ""
-    if msg.reply_to_message.text:
-        source_text = msg.reply_to_message.text.strip()
-    elif msg.reply_to_message.caption:
-        source_text = msg.reply_to_message.caption.strip()
-
+    source_text = (msg.reply_to_message.text or msg.reply_to_message.caption or "").strip()
     if not source_text:
         await msg.reply_text("Не вижу текста для суммаризации (reply-сообщение пустое).")
         return
 
     await msg.reply_text("Готовлю summary...")
 
-    prompt = (
-        "Суммаризируй текст кратко и структурировано.\n"
-        "Требования:\n"
-        "- 5–10 пунктов\n"
-        "- отдельный блок: 'Ключевые решения/действия' (если есть)\n"
-        "- без воды\n\n"
-        f"ТЕКСТ:\n{source_text}"
-    )
-
     try:
-        result = await run_in_threadpool(call_smaipl_chat_completion, prompt)
+        prompt = f"ТЕКСТ:\n{source_text}"
+        result = await smaipl_chat_complete(prompt)
 
-        # Optional: push to SMAIPL chat (if configured)
-        meta = {
-            "source": "telegram",
-            "chat_id": update.effective_chat.id if update.effective_chat else None,
-            "message_id": msg.message_id,
-        }
-        await run_in_threadpool(push_summary_to_smaipl, result, meta)
-
+        # Send back to Telegram
         await msg.reply_text(result)
+
+        # Optional: push to external/SMAIPL endpoint (if you configure it)
+        await push_summary_somewhere(
+            result,
+            meta={
+                "telegram_chat_id": update.effective_chat.id if update.effective_chat else None,
+                "telegram_message_id": msg.message_id,
+            },
+        )
+
     except Exception as e:
         log.exception("Summary generation failed")
         await msg.reply_text(f"Ошибка при генерации summary: {e}")
 
 # ----------------------------
-# FastAPI Webhook Server
+# FastAPI (ASGI) app
 # Fly runs: uvicorn worker:app --host 0.0.0.0 --port ${PORT}
 # ----------------------------
 app = FastAPI()
@@ -186,15 +199,23 @@ async def health() -> Dict[str, Any]:
 
 @app.get("/debug/config")
 async def debug_config() -> Dict[str, Any]:
-    # Безопасно: не светим значения токенов
+    """
+    Safe config visibility for debugging.
+    Does NOT expose full secrets.
+    """
     return {
-        "public_base_url_set": bool(PUBLIC_BASE_URL),
-        "webhook_secret_set": bool(WEBHOOK_SECRET),
-        "bot_token_set": bool(BOT_TOKEN),
-        "smaipl_base_url": SMAIPL_BASE_URL,
-        "smaipl_api_key_set": bool(SMAIPL_API_KEY),
-        "smaipl_model": SMAIPL_MODEL,
-        "smaipl_push_url_set": bool(SMAIPL_PUSH_URL),
+        "BOT_TOKEN_set": bool(BOT_TOKEN),
+        "PUBLIC_BASE_URL": PUBLIC_BASE_URL,
+        "WEBHOOK_SECRET_set": bool(WEBHOOK_SECRET),
+        "WEBHOOK_SECRET_masked": _mask(WEBHOOK_SECRET, keep=8),
+
+        "SMAIPL_BASE_URL": SMAIPL_BASE_URL,
+        "SMAIPL_API_KEY_set": bool(SMAIPL_API_KEY),
+        "SMAIPL_API_KEY_masked": _mask(SMAIPL_API_KEY, keep=10),
+        "SMAIPL_MODEL": SMAIPL_MODEL,
+
+        "SMAIPL_PUSH_URL": SMAIPL_PUSH_URL,
+        "SMAIPL_PUSH_BEARER_set": bool(SMAIPL_PUSH_BEARER),
     }
 
 @app.post("/webhook/{secret}")
@@ -208,20 +229,24 @@ async def telegram_webhook(
     if tg_app is None:
         raise HTTPException(status_code=503, detail="Telegram app is not initialised")
 
-    # Secret in URL
+    # 1) URL secret check
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
-    # Optional header secret (Telegram supports it)
+    # 2) Header secret check (Telegram supports it)
     if WEBHOOK_SECRET and x_telegram_bot_api_secret_token is not None:
         if x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
             raise HTTPException(status_code=403, detail="Invalid secret token header")
 
     data = await request.json()
     update = Update.de_json(data, tg_app.bot)
+
     await tg_app.process_update(update)
     return {"ok": True}
 
+# ----------------------------
+# Startup / Shutdown
+# ----------------------------
 @app.on_event("startup")
 async def on_startup() -> None:
     global tg_app
@@ -262,6 +287,9 @@ async def on_shutdown() -> None:
     except Exception:
         log.exception("Shutdown error")
 
+# ----------------------------
+# Local run (optional)
+# ----------------------------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8080"))
