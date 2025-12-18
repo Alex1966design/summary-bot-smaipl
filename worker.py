@@ -5,14 +5,9 @@ from typing import Any, Dict, Optional
 
 import httpx
 from fastapi import FastAPI, Request, Header, HTTPException
-from starlette.concurrency import run_in_threadpool
 
 from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ----------------------------
 # Logging
@@ -30,11 +25,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 
-# SMAIPL
-SMAIPL_API_URL = os.getenv("SMAIPL_API_URL", "").strip()  # полный URL на /ask/....
-SMAIPL_BOT_ID = os.getenv("SMAIPL_BOT_ID", "").strip()    # например 5129
-SMAIPL_CHAT_ID = os.getenv("SMAIPL_CHAT_ID", "").strip()  # например ask123456
-SMAIPL_RESPONSE_FIELD = os.getenv("SMAIPL_RESPONSE_FIELD", "done").strip()  # "done" по умолчанию
+# SMAIPL (OpenAI-compatible)
+SMAIPL_BASE_URL = os.getenv("SMAIPL_BASE_URL", "https://ai.smaipl.ru/v1").strip().rstrip("/")
+SMAIPL_API_KEY = os.getenv("SMAIPL_API_KEY", "").strip()
+SMAIPL_MODEL = os.getenv("SMAIPL_MODEL", "test_chat_1").strip()
 
 if not BOT_TOKEN:
     log.warning("BOT_TOKEN is empty. Telegram bot will not start until it is set.")
@@ -42,49 +36,74 @@ if not PUBLIC_BASE_URL:
     log.warning("PUBLIC_BASE_URL is empty. Webhook cannot be set without it.")
 if not WEBHOOK_SECRET:
     log.warning("WEBHOOK_SECRET is empty. Webhook path protection is disabled (NOT recommended).")
+if not SMAIPL_API_KEY:
+    log.warning("SMAIPL_API_KEY is empty. SMAIPL calls will fail until it is set.")
 
 # ----------------------------
-# SMAIPL Call
+# SMAIPL Call (OpenAI-compatible)
 # ----------------------------
-def call_smaipl(prompt: str) -> str:
-    """
-    Синхронный вызов SMAIPL (запускаем в threadpool).
-    Ожидаем, что SMAIPL_API_URL уже содержит полный endpoint /ask/<...>.
-    """
-    if not SMAIPL_API_URL:
-        raise RuntimeError("SMAIPL_API_URL is not set")
-    if not SMAIPL_BOT_ID or not SMAIPL_CHAT_ID:
-        raise RuntimeError("SMAIPL_BOT_ID / SMAIPL_CHAT_ID is not set")
+SYSTEM_PROMPT = (
+    "Ты — ассистент по суммаризации. "
+    "Отвечай ТОЛЬКО суммаризацией на русском языке, без JSON, без служебных полей. "
+    "Формат: 5–10 маркеров, затем блок 'Действия' (если есть). "
+    "Не выдумывай факты."
+)
 
-    try:
-        bot_id_int = int(SMAIPL_BOT_ID)
-    except ValueError as e:
-        raise RuntimeError("SMAIPL_BOT_ID must be an integer") from e
+async def call_smaipl(prompt: str) -> str:
+    if not SMAIPL_API_KEY:
+        raise RuntimeError("SMAIPL_API_KEY is not set")
+    url = f"{SMAIPL_BASE_URL}/chat/completions"
 
     payload = {
-        "bot_id": bot_id_int,
-        "chat_id": SMAIPL_CHAT_ID,
-        "message": prompt,
+        "model": SMAIPL_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
     }
 
-    with httpx.Client(timeout=60.0) as client:
-        r = client.post(SMAIPL_API_URL, json=payload)
-        r.raise_for_status()
-        data = r.json()
+    headers = {
+        "Authorization": f"Bearer {SMAIPL_API_KEY}",
+        "Content-Type": "application/json",
+    }
 
-    # типичная ошибка: {"error": true}
-    if isinstance(data, dict) and data.get("error") is True:
-        raise RuntimeError(f"SMAIPL returned error=true. Payload={payload}. Response={data}")
+    # 2 попытки на случай сетевых подвисаний
+    last_err: Optional[Exception] = None
+    for attempt in range(2):
+        try:
+            timeout = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.post(url, headers=headers, json=payload)
+            r.raise_for_status()
+            data = r.json()
 
-    # берём поле ответа
-    if isinstance(data, dict) and SMAIPL_RESPONSE_FIELD in data:
-        return str(data.get(SMAIPL_RESPONSE_FIELD))
+            content = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+            )
+            content = (content or "").strip()
 
-    # запасной вариант: если поле не найдено
-    return json.dumps(data, ensure_ascii=False)
+            # Если модель продолжает возвращать JSON, попробуем вытащить из него текст,
+            # иначе вернём как есть (чтобы было видно, что именно приходит).
+            if content.startswith("{") and content.endswith("}"):
+                # Не ломаемся: просто возвращаем как есть, но без лишней экранизации
+                return content
+
+            if not content:
+                return json.dumps(data, ensure_ascii=False)
+
+            return content
+
+        except Exception as e:
+            last_err = e
+            log.warning(f"SMAIPL call attempt {attempt+1} failed: {e}")
+
+    raise RuntimeError(f"SMAIPL call failed after retries: {last_err}")
 
 # ----------------------------
-# Handlers
+# Telegram Handlers
 # ----------------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
@@ -96,7 +115,6 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
 
-    # Требуем, чтобы /summary было reply на сообщение
     if not msg.reply_to_message or not msg.reply_to_message.text:
         await msg.reply_text(
             "Команду /summary нужно отправлять *ответом* на сообщение для суммаризации.",
@@ -104,7 +122,7 @@ async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    source_text = msg.reply_to_message.text.strip()
+    source_text = (msg.reply_to_message.text or "").strip()
     if not source_text:
         await msg.reply_text("Не вижу текста для суммаризации (reply-сообщение пустое).")
         return
@@ -118,7 +136,7 @@ async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
     try:
-        result = await run_in_threadpool(call_smaipl, prompt)
+        result = await call_smaipl(prompt)
         await msg.reply_text(result)
     except Exception as e:
         log.exception("Summary generation failed")
@@ -129,8 +147,6 @@ async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # IMPORTANT: Fly.io expects an ASGI app called `app` in `worker.py`
 # ----------------------------
 app = FastAPI()
-
-# Telegram Application (PTB) — создаём в startup, чтобы не падать при импорте
 tg_app: Optional[Application] = None
 
 def _build_tg_app() -> Application:
@@ -152,43 +168,32 @@ async def telegram_webhook(
     global tg_app
 
     if tg_app is None:
-        # Telegram не инициализирован (скорее всего нет BOT_TOKEN или старт ещё не прошёл)
         raise HTTPException(status_code=503, detail="Telegram app is not initialised")
 
-    # 1) Проверка секрета в URL
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
-    # 2) Доп. проверка секрета в заголовке (Telegram умеет так)
     if WEBHOOK_SECRET and x_telegram_bot_api_secret_token is not None:
-        # Если Telegram присылает заголовок — проверяем его.
-        # (Если заголовка нет, не блокируем, чтобы не зависеть от настроек Telegram)
         if x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
             raise HTTPException(status_code=403, detail="Invalid secret token header")
 
     data = await request.json()
     update = Update.de_json(data, tg_app.bot)
-
     await tg_app.process_update(update)
     return {"ok": True}
 
-# ----------------------------
-# Startup: init PTB and set webhook
-# ----------------------------
 @app.on_event("startup")
 async def on_startup() -> None:
     global tg_app
 
     if not BOT_TOKEN:
-        log.error("BOT_TOKEN is empty: Telegram app will not start. Set BOT_TOKEN and redeploy/restart.")
+        log.error("BOT_TOKEN is empty: Telegram app will not start.")
         return
 
-    # Инициализируем PTB
     tg_app = _build_tg_app()
     await tg_app.initialize()
     await tg_app.start()
 
-    # Выставляем webhook (если есть базовый URL)
     if not PUBLIC_BASE_URL:
         log.warning("Skipping setWebhook: PUBLIC_BASE_URL missing")
         return
@@ -217,12 +222,7 @@ async def on_shutdown() -> None:
     except Exception:
         log.exception("Shutdown error")
 
-# ----------------------------
-# Entrypoint (local)
-# Note: On Fly.io this block is typically NOT used (uvicorn worker:app is used)
-# ----------------------------
 if __name__ == "__main__":
     import uvicorn
-
     port = int(os.getenv("PORT", "8080"))
     uvicorn.run(app, host="0.0.0.0", port=port)
